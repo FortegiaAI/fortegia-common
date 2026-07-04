@@ -26,10 +26,14 @@ from __future__ import annotations
 import secrets
 from collections.abc import Callable
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 
-internal_key_header = APIKeyHeader(name="X-Internal-Key", auto_error=True)
+# auto_error=False so THIS function owns every failure path with a deterministic
+# status code. With auto_error=True the missing-header case is handled inside
+# Starlette and returns 401/403 depending on the FastAPI version — fragile for a
+# shared contract. Here: missing/empty/wrong key -> 403, unset server key -> 503.
+internal_key_header = APIKeyHeader(name="X-Internal-Key", auto_error=False)
 
 
 def make_internal_key_dependency(
@@ -42,17 +46,22 @@ def make_internal_key_dependency(
     ``get_expected_key`` is a callable so the current setting value is read per
     request (monkeypatch-friendly in tests, honors runtime key rotation). An
     empty configured key returns 503 (fail-closed) rather than accepting a
-    published default.
+    published default. A missing or mismatched key returns 403.
+
+    The header is injected via ``Security(...)`` — a bare ``APIKeyHeader``
+    instance used as a plain default is NOT recognised by FastAPI as a security
+    scheme (the parameter is treated as a required field, yielding a spurious
+    422 on every request).
     """
 
-    async def _require_internal_key(internal_key: str = header) -> str:  # type: ignore[assignment]
+    async def _require_internal_key(internal_key: str | None = Security(header)) -> str:
         expected = get_expected_key() or ""
         if not expected:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Internal key not configured",
             )
-        if not secrets.compare_digest(internal_key, expected):
+        if not internal_key or not secrets.compare_digest(internal_key, expected):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invalid internal key",
